@@ -1,0 +1,155 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  integracao:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Instalar dependências
+        run: npm install --force
+
+      - name: Instalar semver
+        run: npm install -g semver
+
+      - name: Criar nova tag caso não exista
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if [ -z "$(git tag)" ]; then
+            git config --global user.name 'github-actions'
+            git config --global user.email 'github-actions@github.com'
+            git tag -a v0.0.0 -m "Initial release"
+            git push origin v0.0.0
+          else
+            echo "Tag v0.0.0 já existe - nenhuma ação necessária."
+          fi
+
+      - name: Calcular nova versão
+        run: |
+          git fetch --tags
+          LAST_TAG=$(git describe --tags `git rev-list --tags --max-count=1`)
+          if [ -z "$LAST_TAG" ]; then
+            LAST_TAG="v0.0.0"
+          fi
+          echo "Versão Atual: $LAST_TAG"
+          
+          if [ "$LAST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --pretty=format:"%s")
+          else
+            COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"%s")
+          fi
+          
+          echo "Commits desde a última tag:"
+          echo "$COMMITS"
+          
+          # Inicializando variáveis
+          MAJOR=0
+          MINOR=0
+          PATCH=0
+          
+          # Analisando mensagens de commit
+          for COMMIT in "$COMMITS"; do
+            if [[ "$COMMIT" == *"BREAKING CHANGE"* ]]; then
+              MAJOR=1
+            elif [[ "$COMMIT" == *"feat"* ]]; then
+              MINOR=1
+            elif [[ "$COMMIT" == *"fix"* ]]; then
+              PATCH=1
+            fi
+          done
+          
+          # Calculando a nova versão usando semver
+          CURRENT_VERSION=${LAST_TAG#v}
+          NEW_VERSION=$CURRENT_VERSION
+          if [[ $MAJOR -eq 1 ]]; then
+            NEW_VERSION=$(semver -i major $CURRENT_VERSION)
+          elif [[ $MINOR -eq 1 ]]; then
+            NEW_VERSION=$(semver -i minor $CURRENT_VERSION)
+          elif [[ $PATCH -eq 1 ]]; then
+            NEW_VERSION=$(semver -i patch $CURRENT_VERSION)
+          fi
+          
+          echo "Vesões (atual / nova): $CURRENT_VERSION # $NEW_VERSION"
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV 
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Definir o nome do repositório
+        run: |
+          # Obtém o nome do repositório do Github completo
+          REPO_NAME="${{ github.repository }}"
+
+          # Quebra o valor por "/" e utiliza a última parte apenas (ex.: nome_conta_github/nome_repositorio -> nome_repositorio) 
+          REPO_NAME="${REPO_NAME#*/}"
+
+          # Armazenando o nome do repositório em uma variável, para utilizar no próximo passo
+          echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV 
+          echo "Repositório: $REPO_NAME"
+      
+      - name: Verificar e criar repositório no Docker Hub (se necessário)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "Verificando repositório: $REPO_NAME"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -u $DOCKERHUB_USERNAME:$DOCKERHUB_TOKEN \
+            "https://hub.docker.com/v2/repositories/$DOCKERHUB_USERNAME/$REPO_NAME/")
+          
+          if [ "$RESPONSE" -eq 404 ]; then
+            echo "Repositório não existe. Criando repositório no Docker Hub..."
+            curl -s -X POST -u $DOCKERHUB_USERNAME:$DOCKERHUB_TOKEN \
+              -H "Content-Type: application/json" \
+              -d '{"name": "'$REPO_NAME'", "is_private": true}' \
+              "https://hub.docker.com/v2/repositories/$DOCKERHUB_USERNAME/"
+            echo "Repositório $REPO_NAME criado com sucesso!"
+          else
+            echo "Repositório $REPO_NAME já existe no Docker Hub."
+          fi
+
+      - name: Criar imagem docker
+        run: |
+          echo "Iniciando build da imagem Docker para o repositório $REPO_NAME - Versão: $NEW_VERSION"
+
+          #Cria a imagem com o nome do usuário no dockerhub / nome_repositorio : tag_calculada
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME:$NEW_VERSION .
+
+          #Cria a tag latest da imagem
+          docker tag ${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME:$NEW_VERSION ${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME:latest
+
+      - name: Efetuar push da imagem
+        run: |
+          echo "Fazendo push da imagem Docker para o Docker Hub ${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME:$NEW_VERSION" 
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME:$NEW_VERSION
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/$REPO_NAME:latest
+      
+      - name: Atualizar versão no package.json
+        run: |
+          npm version $NEW_VERSION --no-git-tag-version
+          
+      - name: Commit e push
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+          git add package.json
+          git commit -m "chore(release): version $NEW_VERSION"
+          git tag v$NEW_VERSION
+          git push origin main --tags
+
